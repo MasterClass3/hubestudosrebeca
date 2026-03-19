@@ -1,7 +1,10 @@
+import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from app.services.callback_service import get_client
+
+logger = logging.getLogger(__name__)
 from app.services.pdf_service import download_and_extract_text, PDFExtractionError, PDFScannedError
 from app.services.ai_extraction import extract_and_save_questions
 from app.services.ai_analysis import generate_analysis_for_questions
@@ -31,7 +34,15 @@ def _run_pipeline(pdf_upload_id: str):
             return
 
         cb.update_pdf_status(pdf_upload_id, "processing")
-        text = download_and_extract_text(upload["file_path"])
+
+        # Monta o path completo: user_id/file_path (se ainda não incluído)
+        file_path = upload["file_path"]
+        user_id = upload.get("user_id", "")
+        if user_id and not file_path.startswith(user_id):
+            file_path = f"{user_id}/{file_path}"
+        logger.info(f"[Pipeline] file_path para signed URL: '{file_path}'")
+
+        text = download_and_extract_text(file_path)
 
         if upload["type"] == "exam":
             question_ids = extract_and_save_questions(
