@@ -35,13 +35,8 @@ def _run_pipeline(pdf_upload_id: str):
 
         cb.update_pdf_status(pdf_upload_id, "processing")
 
-        # Monta o path completo: user_id/file_path (se ainda não incluído)
         file_path = upload["file_path"]
-        user_id = upload.get("user_id", "")
-        if user_id and not file_path.startswith(user_id):
-            file_path = f"{user_id}/{file_path}"
         logger.info(f"[Pipeline] file_path para signed URL: '{file_path}'")
-
         text = download_and_extract_text(file_path)
 
         if upload["type"] == "exam":
