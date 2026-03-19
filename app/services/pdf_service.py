@@ -1,10 +1,9 @@
 import io
+import logging
 import httpx
 import pdfplumber
 
-from app.config import get_settings
-
-SUPABASE_STORAGE_URL = "https://epdiqyrhfkwfigdcpngw.supabase.co/storage/v1/object"
+logger = logging.getLogger(__name__)
 
 
 class PDFExtractionError(Exception):
@@ -17,34 +16,39 @@ class PDFScannedError(PDFExtractionError):
 
 def download_and_extract_text(file_path: str) -> str:
     """
-    Baixa um PDF do Supabase Storage (bucket 'pdfs') e extrai o texto.
-    Usa a anon key via REST API do storage.
+    1. Obtém uma signed URL via Edge Function (process-callback)
+    2. Baixa o PDF com httpx usando a signed URL
+    3. Extrai o texto com pdfplumber
     """
-    settings = get_settings()
+    from app.services.callback_service import get_client
 
-    # Tenta download via Storage REST API com a anon key
-    url = f"{SUPABASE_STORAGE_URL}/pdfs/{file_path}"
+    logger.info(f"[PDF] Solicitando signed URL para file_path='{file_path}' bucket='pdfs'")
+
+    cb = get_client()
     try:
-        response = httpx.get(
-            url,
-            headers={
-                "apikey": settings.supabase_anon_key,
-                "Authorization": f"Bearer {settings.supabase_anon_key}",
-            },
-            timeout=60.0,
-            follow_redirects=True,
-        )
+        signed_url = cb.get_signed_url(file_path, bucket="pdfs", expires_in=120)
+        logger.info(f"[PDF] Signed URL obtida: {signed_url[:80]}...")
+    except Exception as e:
+        raise PDFExtractionError(f"Falha ao obter signed URL para '{file_path}': {e}")
+
+    logger.info(f"[PDF] Baixando PDF via signed URL")
+    try:
+        response = httpx.get(signed_url, timeout=120.0, follow_redirects=True)
+        logger.info(f"[PDF] Download HTTP status: {response.status_code}")
         response.raise_for_status()
         pdf_bytes = response.content
     except httpx.HTTPStatusError as e:
-        raise PDFExtractionError(f"Falha ao baixar PDF '{file_path}': HTTP {e.response.status_code}")
+        raise PDFExtractionError(
+            f"Falha ao baixar PDF '{file_path}': HTTP {e.response.status_code} — {e.response.text[:200]}"
+        )
     except Exception as e:
         raise PDFExtractionError(f"Falha ao baixar PDF '{file_path}': {e}")
 
     if not pdf_bytes:
         raise PDFExtractionError(f"Download retornou vazio para '{file_path}'")
 
-    # Extração de texto
+    logger.info(f"[PDF] PDF baixado com sucesso ({len(pdf_bytes)} bytes). Extraindo texto...")
+
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             if not pdf.pages:
@@ -68,4 +72,5 @@ def download_and_extract_text(file_path: str) -> str:
             "O PDF parece ser escaneado (imagem). OCR não é suportado por enquanto."
         )
 
+    logger.info(f"[PDF] Texto extraído com sucesso ({len(full_text)} caracteres)")
     return full_text

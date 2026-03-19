@@ -103,6 +103,18 @@ class SupabaseCallbackClient:
             t.setdefault("study_plan_id", study_plan_id)
         return self.call("insert_syllabus_topics", {"topics": topics})
 
+    def get_signed_url(self, file_path: str, bucket: str = "pdfs", expires_in: int = 60) -> str:
+        """Gera uma signed URL para download de arquivo do Supabase Storage."""
+        result = self.call("get_signed_url", {
+            "file_path": file_path,
+            "bucket": bucket,
+            "expires_in": expires_in,
+        })
+        signed_url = result.get("signed_url") or result.get("signedUrl") or result.get("signedURL")
+        if not signed_url:
+            raise RuntimeError(f"Edge Function não retornou signed_url. Resposta: {result}")
+        return signed_url
+
 
 # Instância singleton para reutilizar conexão HTTP
 _client: SupabaseCallbackClient | None = None
