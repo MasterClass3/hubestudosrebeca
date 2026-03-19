@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(pip show:*)",
+      "Bash(python -c \"from app.main import app; print\\(''Import OK''\\)\")",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(python -c \":*)",
+      "Bash(python:*)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill:*)",
+      "Bash(kill 29016)",
+      "Bash(cmd.exe /c \"taskkill /F /PID 29016\" 2>&1)",
+      "Bash(cmd.exe /c \"for /f \\\\\"tokens=5\\\\\" %a in \\('netstat -aon ^| findstr :8000'\\) do taskkill /F /PID %a\" 2>&1)",
+      "Bash(curl -s http://localhost:8001/health)"
+    ]
+  }
+}
