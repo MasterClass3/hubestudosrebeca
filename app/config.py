@@ -7,9 +7,9 @@ class Settings(BaseSettings):
 
     supabase_url: str
     supabase_anon_key: str = ""
-    supabase_service_role_key: str = ""
     anthropic_api_key: str
     ai_model: str = "claude-sonnet-4-6"
+    callback_url: str = "https://epdiqyrhfkwfigdcpngw.supabase.co/functions/v1/process-callback"
     webhook_secret: str = ""
 
 

@@ -4,7 +4,7 @@ import textwrap
 import anthropic
 
 from app.config import get_settings
-from app.services import db_client
+from app.services.callback_service import get_client
 
 CHUNK_SIZE = 12_000
 
@@ -40,7 +40,6 @@ Regras:
 - Identifique nomes de disciplinas em maiúsculas ou com numeração romana
 - Preserve a hierarquia original (tópicos e subtópicos)
 - Se houver numeração (1.1, 1.2), use para determinar order_index
-- Se não houver hierarquia clara, todos os tópicos ficam no nível raiz
 
 TEXTO DO EDITAL:
 """
@@ -54,62 +53,36 @@ def _parse_json(raw: str) -> dict:
     return json.loads(raw)
 
 
-def _flatten_topics(
-    study_plan_id: str,
-    subject_name: str,
-    topics: list[dict],
-    parent_id: str | None = None,
-) -> list[dict]:
-    """Achata a hierarquia de tópicos para inserção em batch."""
-    flat = []
-    for topic in topics:
-        flat.append({
-            "study_plan_id": study_plan_id,
-            "subject_name": subject_name,
-            "topic_title": topic["topic_title"],
-            "parent_topic_id": parent_id,
-            "order_index": topic.get("order_index", 0),
-            "is_completed": False,
-            "_subtopics": topic.get("subtopics", []),
-        })
-    return flat
-
-
 def _insert_topics_recursive(
+    cb,
     study_plan_id: str,
     subject_name: str,
     topics: list[dict],
     parent_id: str | None = None,
 ):
-    """Insere tópicos recursivamente via Edge Function."""
     for topic in topics:
-        subtopics = topic.pop("_subtopics", topic.get("subtopics", []))
+        subtopics = topic.get("subtopics", [])
         payload = {
-            "study_plan_id": study_plan_id,
             "subject_name": subject_name,
             "topic_title": topic["topic_title"],
             "parent_topic_id": parent_id,
             "order_index": topic.get("order_index", 0),
             "is_completed": False,
         }
-        result = db_client.insert_syllabus_topics([payload])
-        # Tenta obter o ID do tópico inserido para usar como parent_id nos subtópicos
+        result = cb.insert_syllabus_topics([payload], study_plan_id)
         new_id = None
         if isinstance(result, dict):
             data = result.get("data", [])
             if data:
                 new_id = data[0].get("id")
-
         if subtopics:
-            _insert_topics_recursive(study_plan_id, subject_name, subtopics, new_id)
+            _insert_topics_recursive(cb, study_plan_id, subject_name, subtopics, new_id)
 
 
 def extract_and_save_syllabus(text: str, study_plan_id: str) -> dict:
-    """
-    Extrai conteúdo programático do texto e salva via Edge Function.
-    """
     settings = get_settings()
     ai_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    cb = get_client()
 
     chunks = (
         [text]
@@ -134,7 +107,7 @@ def extract_and_save_syllabus(text: str, study_plan_id: str) -> dict:
     for subject in all_subjects:
         subject_name = subject.get("subject_name", "Sem disciplina")
         topics = subject.get("topics", [])
-        _insert_topics_recursive(study_plan_id, subject_name, topics)
+        _insert_topics_recursive(cb, study_plan_id, subject_name, topics)
         subject_count += 1
         topic_count += len(topics)
 

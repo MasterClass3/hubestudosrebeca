@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.services import db_client
+from app.services.callback_service import get_client
 
 router = APIRouter()
 
@@ -7,7 +7,7 @@ router = APIRouter()
 @router.get("/health")
 def health_check():
     try:
-        db_client.read("pdf_uploads", {})
+        get_client().read("pdf_uploads", {})
         edge_status = "connected"
     except Exception as e:
         edge_status = f"error: {str(e)}"

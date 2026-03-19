@@ -5,9 +5,8 @@ from typing import Any
 import anthropic
 
 from app.config import get_settings
-from app.services import db_client
+from app.services.callback_service import get_client
 
-# ~3000 tokens ≈ 12000 caracteres (estimativa conservadora)
 CHUNK_SIZE = 12_000
 
 EXTRACTION_PROMPT = """
@@ -62,33 +61,18 @@ def _extract_questions_from_chunk(client: anthropic.Anthropic, chunk: str, model
     return data.get("questions", [])
 
 
-def _get_or_create_subject(study_plan_id: str, subject_name: str, cache: dict) -> str:
-    if subject_name in cache:
-        return cache[subject_name]
-
-    # Busca existente
-    existing = db_client.read("subjects", {"study_plan_id": study_plan_id, "name": subject_name})
-    if existing:
-        subject_id = existing[0]["id"]
-    else:
-        created = db_client.insert_subjects([{"study_plan_id": study_plan_id, "name": subject_name}])
-        subject_id = created[0]["id"] if created else None
-
-    cache[subject_name] = subject_id
-    return subject_id
-
-
 def extract_and_save_questions(
     raw_text: str,
     study_plan_id: str,
     source_pdf_id: str,
 ) -> list[str]:
     """
-    Extrai questões do texto bruto via IA e salva no banco via Edge Function.
+    Extrai questões do texto bruto via IA e salva via Edge Function.
     Retorna lista de IDs das questões criadas.
     """
     settings = get_settings()
     ai_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    cb = get_client()
 
     chunks = _chunk_text(raw_text)
     all_questions: list[dict[str, Any]] = []
@@ -105,12 +89,11 @@ def extract_and_save_questions(
 
     for q in all_questions:
         topic = q.get("topic", "Geral")
-        subject_id = _get_or_create_subject(study_plan_id, topic, subject_cache)
+        if topic not in subject_cache:
+            subject_cache[topic] = cb.upsert_subject(topic, study_plan_id)
 
         questions_payload.append({
-            "study_plan_id": study_plan_id,
-            "source_pdf_id": source_pdf_id,
-            "subject_id": subject_id,
+            "subject_id": subject_cache[topic],
             "statement": q.get("statement", ""),
             "alternatives": q.get("alternatives", []),
             "correct_answer": q.get("correct_answer", ""),
@@ -118,5 +101,4 @@ def extract_and_save_questions(
             "difficulty": q.get("difficulty", "medium"),
         })
 
-    created_ids = db_client.insert_questions(questions_payload)
-    return created_ids
+    return cb.insert_questions(questions_payload, study_plan_id, source_pdf_id)
