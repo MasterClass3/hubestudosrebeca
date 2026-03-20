@@ -2,8 +2,11 @@
 SupabaseCallbackClient — todas as operações de banco passam pela
 Edge Function process-callback do Supabase.
 """
+import logging
 import httpx
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
 
@@ -105,14 +108,27 @@ class SupabaseCallbackClient:
 
     def get_signed_url(self, file_path: str, bucket: str = "pdfs", expires_in: int = 60) -> str:
         """Gera uma signed URL para download de arquivo do Supabase Storage."""
-        result = self.call("get_signed_url", {
-            "file_path": file_path,
-            "bucket": bucket,
-            "expires_in": expires_in,
-        })
+        body = {"action": "get_signed_url", "data": {"file_path": file_path, "bucket": bucket, "expires_in": expires_in}}
+        logger.info(f"[get_signed_url] Enviando para Edge Function: {body}")
+
+        response = httpx.post(
+            self._url,
+            json=body,
+            headers={"Content-Type": "application/json", "x-webhook-secret": self._secret},
+            timeout=_TIMEOUT,
+        )
+        logger.info(f"[get_signed_url] Status: {response.status_code}")
+        logger.info(f"[get_signed_url] Body da resposta: {response.text[:500]}")
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Edge Function retornou {response.status_code}: {response.text[:300]}"
+            )
+
+        result = response.json()
         signed_url = result.get("signed_url") or result.get("signedUrl") or result.get("signedURL")
         if not signed_url:
-            raise RuntimeError(f"Edge Function não retornou signed_url. Resposta: {result}")
+            raise RuntimeError(f"Edge Function não retornou signed_url. Resposta completa: {result}")
         return signed_url
 
 
