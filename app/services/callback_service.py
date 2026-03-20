@@ -109,7 +109,7 @@ class SupabaseCallbackClient:
     def get_signed_url(self, file_path: str, bucket: str = "pdfs", expires_in: int = 60) -> str:
         """Gera uma signed URL para download de arquivo do Supabase Storage."""
         body = {"action": "get_signed_url", "data": {"file_path": file_path, "bucket": bucket, "expires_in": expires_in}}
-        logger.info(f"[get_signed_url] Enviando para Edge Function: {body}")
+        logger.info(f"[SignedURL] Enviando: {body}")
 
         response = httpx.post(
             self._url,
@@ -117,8 +117,7 @@ class SupabaseCallbackClient:
             headers={"Content-Type": "application/json", "x-webhook-secret": self._secret},
             timeout=_TIMEOUT,
         )
-        logger.info(f"[get_signed_url] Status: {response.status_code}")
-        logger.info(f"[get_signed_url] Body da resposta: {response.text[:500]}")
+        logger.info(f"[SignedURL] status={response.status_code} body={response.text[:500]}")
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -126,9 +125,20 @@ class SupabaseCallbackClient:
             )
 
         result = response.json()
-        signed_url = result.get("signed_url") or result.get("signedUrl") or result.get("signedURL")
+
+        # Trata todas as variações possíveis de resposta
+        signed_url = (
+            result.get("signed_url")
+            or result.get("signedUrl")
+            or result.get("signedURL")
+            or (result.get("payload") or {}).get("signed_url")
+            or (result.get("payload") or {}).get("signedUrl")
+            or (result.get("data") or {}).get("signed_url")
+            or (result.get("data") or {}).get("signedUrl")
+        )
+
         if not signed_url:
-            raise RuntimeError(f"Edge Function não retornou signed_url. Resposta completa: {result}")
+            raise RuntimeError(f"signed_url não encontrada na resposta: {response.text[:300]}")
         return signed_url
 
 

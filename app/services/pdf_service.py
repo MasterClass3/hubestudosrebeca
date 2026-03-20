@@ -34,13 +34,14 @@ def download_and_extract_text(file_path: str) -> str:
     logger.info(f"[PDF] Baixando PDF via signed URL")
     try:
         response = httpx.get(signed_url, timeout=120.0, follow_redirects=True)
-        logger.info(f"[PDF] Download HTTP status: {response.status_code}")
-        response.raise_for_status()
+        logger.info(f"[PDF] download status={response.status_code} tamanho={len(response.content)} bytes")
+        if response.status_code != 200:
+            raise PDFExtractionError(
+                f"Download falhou: HTTP {response.status_code} - {response.text[:200]}"
+            )
         pdf_bytes = response.content
-    except httpx.HTTPStatusError as e:
-        raise PDFExtractionError(
-            f"Falha ao baixar PDF '{file_path}': HTTP {e.response.status_code} — {e.response.text[:200]}"
-        )
+    except PDFExtractionError:
+        raise
     except Exception as e:
         raise PDFExtractionError(f"Falha ao baixar PDF '{file_path}': {e}")
 
