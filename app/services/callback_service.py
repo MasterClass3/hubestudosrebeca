@@ -126,15 +126,16 @@ class SupabaseCallbackClient:
 
         result = response.json()
 
-        # Trata todas as variações possíveis de resposta
+        # Formato primário: { "data": { "signed_url": "..." } }
+        # Fallbacks para outras variações
         signed_url = (
-            result.get("signed_url")
+            (result.get("data") or {}).get("signed_url")
+            or (result.get("data") or {}).get("signedUrl")
+            or result.get("signed_url")
             or result.get("signedUrl")
             or result.get("signedURL")
             or (result.get("payload") or {}).get("signed_url")
             or (result.get("payload") or {}).get("signedUrl")
-            or (result.get("data") or {}).get("signed_url")
-            or (result.get("data") or {}).get("signedUrl")
         )
 
         if not signed_url:
