@@ -60,7 +60,7 @@ def _run_pipeline(pdf_upload_id: str):
     stage = "Iniciando"
 
     try:
-        # Etapa 1
+        # Etapa 1 — busca registro e inicia
         stage = "Preparando o documento"
         logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
         upload = cb.get_pdf_upload(pdf_upload_id)
@@ -68,23 +68,27 @@ def _run_pipeline(pdf_upload_id: str):
             logger.error(f"[Pipeline:{pdf_upload_id}] Registro não encontrado no banco")
             return
 
-        cb.update_progress(pdf_upload_id, status="processing", progress=5, stage=stage)
+        cb.update_pdf_status(
+            pdf_upload_id, "processing",
+            progress=5, stage=stage,
+            processing_started_at=_now_iso(),
+        )
         _check_cancel(cb, pdf_upload_id, stage)
 
-        # Etapa 2
+        # Etapa 2 — download
         stage = "Baixando o arquivo"
         logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-        cb.update_progress(pdf_upload_id, progress=15, stage=stage)
+        cb.update_heartbeat(pdf_upload_id, 15, stage)
         _check_cancel(cb, pdf_upload_id, stage)
         _check_timeout(started_at, pdf_upload_id, stage)
 
         file_path = upload["file_path"]
         logger.info(f"[Pipeline:{pdf_upload_id}] file_path='{file_path}'")
 
-        # Etapa 3
+        # Etapa 3 — extração de texto
         stage = "Lendo o conteúdo"
         logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-        cb.update_progress(pdf_upload_id, progress=25, stage=stage)
+        cb.update_heartbeat(pdf_upload_id, 25, stage)
         text = download_and_extract_text(file_path)
         logger.info(f"[Pipeline:{pdf_upload_id}] Texto extraído: {len(text)} chars")
         _check_cancel(cb, pdf_upload_id, stage)
@@ -93,10 +97,9 @@ def _run_pipeline(pdf_upload_id: str):
         pdf_type = upload.get("type")
 
         if pdf_type == "exam":
-            # Etapa 4
             stage = "Identificando as questões"
             logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-            cb.update_progress(pdf_upload_id, progress=40, stage=stage)
+            cb.update_heartbeat(pdf_upload_id, 40, stage)
             _check_cancel(cb, pdf_upload_id, stage)
             _check_timeout(started_at, pdf_upload_id, stage)
 
@@ -107,16 +110,15 @@ def _run_pipeline(pdf_upload_id: str):
             )
             logger.info(f"[Pipeline:{pdf_upload_id}] {len(question_ids)} questões extraídas")
 
-            # Etapa 5
             stage = "Salvando no banco"
-            cb.update_progress(pdf_upload_id, progress=65, stage=stage)
+            cb.update_heartbeat(pdf_upload_id, 65, stage)
             _check_cancel(cb, pdf_upload_id, stage)
             _check_timeout(started_at, pdf_upload_id, stage)
 
             if question_ids:
                 stage = "Gerando análises"
                 logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-                cb.update_progress(pdf_upload_id, progress=80, stage=stage)
+                cb.update_heartbeat(pdf_upload_id, 80, stage)
                 _check_cancel(cb, pdf_upload_id, stage)
                 _check_timeout(started_at, pdf_upload_id, stage)
                 generate_analysis_for_questions(question_ids)
@@ -124,45 +126,41 @@ def _run_pipeline(pdf_upload_id: str):
         elif pdf_type == "syllabus":
             stage = "Identificando o conteúdo programático"
             logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-            cb.update_progress(pdf_upload_id, progress=40, stage=stage)
+            cb.update_heartbeat(pdf_upload_id, 40, stage)
             _check_cancel(cb, pdf_upload_id, stage)
             _check_timeout(started_at, pdf_upload_id, stage)
 
             extract_and_save_syllabus(text=text, study_plan_id=upload["study_plan_id"])
+            cb.update_heartbeat(pdf_upload_id, 80, "Salvando no banco")
 
-            stage = "Salvando no banco"
-            cb.update_progress(pdf_upload_id, progress=80, stage=stage)
-
-        # Etapa final
+        # Concluído
         stage = "Finalizando"
-        logger.info(f"[Pipeline:{pdf_upload_id}] {stage} — concluído com sucesso")
-        cb.update_progress(
-            pdf_upload_id,
-            status="completed",
-            progress=100,
-            stage="Concluído",
+        logger.info(f"[Pipeline:{pdf_upload_id}] Concluído com sucesso")
+        cb.update_pdf_status(
+            pdf_upload_id, "completed",
+            progress=100, stage="Concluído",
             completed_at=_now_iso(),
         )
 
     except InterruptedError as e:
         msg = str(e)
         logger.info(f"[Pipeline:{pdf_upload_id}] CANCELADO — {msg}")
-        cb.update_progress(pdf_upload_id, status="cancelled", stage="Cancelado pelo usuário", error_message=msg)
+        cb.update_pdf_status(pdf_upload_id, "cancelled", stage="Cancelado pelo usuário", error_message=msg)
 
     except TimeoutError as e:
         msg = str(e)
         logger.error(f"[Pipeline:{pdf_upload_id}] TIMEOUT — {msg}")
-        cb.update_progress(pdf_upload_id, status="stalled", stage="Tempo limite excedido", error_message=msg)
+        cb.update_pdf_status(pdf_upload_id, "stalled", stage="Tempo limite excedido", error_message=msg)
 
     except (PDFScannedError, PDFExtractionError) as e:
         msg = repr(e)
         logger.error(f"[Pipeline:{pdf_upload_id}] ERRO PDF na etapa '{stage}': {msg}")
-        cb.update_progress(pdf_upload_id, status="error", stage=f"Erro: {stage}", error_message=msg)
+        cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro: {stage}", error_message=msg)
 
     except Exception as e:
         msg = repr(e)
         logger.error(f"[Pipeline:{pdf_upload_id}] ERRO INESPERADO na etapa '{stage}': {msg}")
-        cb.update_progress(pdf_upload_id, status="error", stage=f"Erro inesperado: {stage}", error_message=msg)
+        cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro inesperado: {stage}", error_message=msg)
 
 
 def _format_status(upload: dict) -> dict:

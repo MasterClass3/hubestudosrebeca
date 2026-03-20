@@ -69,41 +69,44 @@ class SupabaseCallbackClient:
     # Escrita de status / progresso                                         #
     # ------------------------------------------------------------------ #
 
-    def update_pdf_status(self, pdf_id: str, status: str, error_message: str | None = None):
-        """Atualiza apenas o status (compatibilidade)."""
-        data: dict = {"pdf_id": pdf_id, "status": status}
-        if error_message:
-            data["error_message"] = error_message
-        return self.call("update_pdf_status", data)
-
-    def update_progress(
+    def update_pdf_status(
         self,
         pdf_id: str,
+        status: str,
         *,
-        status: str | None = None,
         progress: int | None = None,
         stage: str | None = None,
         error_message: str | None = None,
+        processing_started_at: str | None = None,
         completed_at: str | None = None,
     ):
         """
-        Atualiza status, progresso e estágio em uma única chamada.
-        Envia apenas os campos fornecidos.
+        Muda o status do job (processing, completed, error, cancelled, stalled).
+        Usar em transições de estado — não em atualizações intermediárias.
         """
-        data: dict = {"pdf_id": pdf_id}
-        if status is not None:
-            data["status"] = status
+        data: dict = {"pdf_id": pdf_id, "status": status}
         if progress is not None:
             data["progress"] = progress
         if stage is not None:
             data["processing_stage"] = stage
         if error_message is not None:
             data["error_message"] = error_message
+        if processing_started_at is not None:
+            data["processing_started_at"] = processing_started_at
         if completed_at is not None:
             data["completed_at"] = completed_at
-        # Sempre atualiza heartbeat ao chamar este método
-        data["update_heartbeat"] = True
         return self.call("update_pdf_status", data)
+
+    def update_heartbeat(self, pdf_id: str, progress: int, stage: str):
+        """
+        Atualização leve entre etapas — atualiza progress, stage e last_heartbeat_at.
+        Não muda o status.
+        """
+        return self.call("update_heartbeat", {
+            "pdf_id": pdf_id,
+            "progress": progress,
+            "processing_stage": stage,
+        })
 
     def request_cancel(self, pdf_id: str):
         """Marca cancel_requested = true no banco."""
