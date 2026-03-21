@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     anthropic_api_key: str
     ai_model: str = "claude-sonnet-4-6"
+    ai_extraction_model: str = "claude-haiku-4-5-20251001"
+    extraction_parallelism: int = 5
     callback_url: str = "https://epdiqyrhfkwfigdcpngw.supabase.co/functions/v1/process-callback"
     webhook_secret: str = ""
 
