@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -8,14 +8,13 @@ from pydantic import BaseModel
 from app.services.callback_service import get_client
 from app.services.pdf_service import download_and_extract_text, PDFExtractionError, PDFScannedError
 from app.services.ai_extraction import extract_and_save_questions
-from app.services.ai_analysis import generate_analysis_for_questions
 from app.services.syllabus_service import extract_and_save_syllabus
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Timeout máximo de processamento (10 minutos)
-MAX_PROCESSING_SECONDS = 600
+MAX_PROCESSING_SECONDS = 600      # 10 min timeout geral
+STALE_HEARTBEAT_MINUTES = 10      # job sem heartbeat por 10 min → stalled
 
 
 class ProcessRequest(BaseModel):
@@ -39,93 +38,126 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _check_cancel(cb, pdf_upload_id: str, stage: str):
-    """Lança CancelledError se cancelamento foi solicitado."""
-    if cb.check_cancel_requested(pdf_upload_id):
-        raise InterruptedError(f"Cancelamento solicitado na etapa: {stage}")
+def _log(pdf_id: str, event: str, msg: str):
+    logger.info(f"[{event}] [{pdf_id}] {datetime.now(timezone.utc).isoformat()} — {msg}")
 
 
-def _check_timeout(started_at: float, pdf_upload_id: str, stage: str):
-    """Lança TimeoutError se o job excedeu o tempo máximo."""
-    elapsed = time.time() - started_at
-    if elapsed > MAX_PROCESSING_SECONDS:
-        raise TimeoutError(
-            f"Timeout após {int(elapsed)}s na etapa '{stage}'"
-        )
-
+# ------------------------------------------------------------------ #
+# Worker principal                                                      #
+# ------------------------------------------------------------------ #
 
 def _run_pipeline(pdf_upload_id: str):
     cb = get_client()
     started_at = time.time()
-    stage = "Iniciando"
+    current_stage = "Iniciando"
+
+    def heartbeat(progress: int, stage: str):
+        nonlocal current_stage
+        current_stage = stage
+        _log(pdf_upload_id, "HEARTBEAT", f"{stage} ({progress}%)")
+        try:
+            cb.update_heartbeat(pdf_upload_id, progress, stage)
+        except Exception as hb_err:
+            logger.warning(f"[HEARTBEAT] [{pdf_upload_id}] falhou: {hb_err}")
+
+    def check_cancel():
+        if cb.check_cancel_requested(pdf_upload_id):
+            raise InterruptedError(f"Cancelamento solicitado na etapa: {current_stage}")
+
+    def check_timeout():
+        elapsed = time.time() - started_at
+        if elapsed > MAX_PROCESSING_SECONDS:
+            raise TimeoutError(f"Timeout ({int(elapsed)}s) na etapa: {current_stage}")
 
     try:
-        # Etapa 1 — busca registro e inicia
-        stage = "Preparando o documento"
-        logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
+        # ── ETAPA 1: buscar registro ─────────────────────────────────────
+        current_stage = "Preparando o documento"
+        _log(pdf_upload_id, "START", current_stage)
         upload = cb.get_pdf_upload(pdf_upload_id)
         if not upload:
-            logger.error(f"[Pipeline:{pdf_upload_id}] Registro não encontrado no banco")
+            logger.error(f"[START] [{pdf_upload_id}] registro não encontrado no banco — abortando")
             return
 
         cb.update_pdf_status(
             pdf_upload_id, "processing",
-            progress=5, stage=stage,
+            progress=5, stage=current_stage,
             processing_started_at=_now_iso(),
         )
-        _check_cancel(cb, pdf_upload_id, stage)
+        check_cancel()
 
-        # Etapa 2 — download
-        stage = "Baixando o arquivo"
-        logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-        cb.update_heartbeat(pdf_upload_id, 15, stage)
-        _check_cancel(cb, pdf_upload_id, stage)
-        _check_timeout(started_at, pdf_upload_id, stage)
+        # ── ETAPA 2: gerar signed URL ────────────────────────────────────
+        current_stage = "Baixando o arquivo"
+        _log(pdf_upload_id, "STEP_BEGIN", current_stage)
+        heartbeat(15, current_stage)
+        check_cancel()
+        check_timeout()
 
-        file_path = upload["file_path"]
-        logger.info(f"[Pipeline:{pdf_upload_id}] file_path='{file_path}'")
+        file_path = upload.get("file_path", "")
+        _log(pdf_upload_id, "STEP_BEGIN", f"file_path='{file_path}'")
 
-        # Etapa 3 — extração de texto
-        stage = "Lendo o conteúdo"
-        logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-        cb.update_heartbeat(pdf_upload_id, 25, stage)
-        text = download_and_extract_text(file_path)
-        logger.info(f"[Pipeline:{pdf_upload_id}] Texto extraído: {len(text)} chars")
-        _check_cancel(cb, pdf_upload_id, stage)
-        _check_timeout(started_at, pdf_upload_id, stage)
+        # ── ETAPA 3: baixar PDF e extrair texto ──────────────────────────
+        current_stage = "Lendo o conteúdo"
+        _log(pdf_upload_id, "STEP_BEGIN", current_stage)
+        heartbeat(25, current_stage)
+
+        try:
+            text = download_and_extract_text(file_path)
+        except PDFScannedError as e:
+            raise PDFScannedError(e) from e
+        except PDFExtractionError as e:
+            raise PDFExtractionError(e) from e
+        except Exception as e:
+            raise RuntimeError(f"Falha ao ler PDF: {repr(e)}") from e
+
+        _log(pdf_upload_id, "STEP_SUCCESS", f"texto extraído: {len(text)} chars")
+        check_cancel()
+        check_timeout()
 
         pdf_type = upload.get("type")
 
         if pdf_type == "exam":
-            stage = "Identificando as questões"
-            logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-            cb.update_heartbeat(pdf_upload_id, 40, stage)
-            _check_cancel(cb, pdf_upload_id, stage)
-            _check_timeout(started_at, pdf_upload_id, stage)
+            # ── ETAPA 4: identificar questões (loop com heartbeats) ──────
+            current_stage = "Identificando as questões"
+            _log(pdf_upload_id, "STEP_BEGIN", current_stage)
+            heartbeat(35, current_stage)
+            check_cancel()
+            check_timeout()
 
-            question_ids = extract_and_save_questions(
-                raw_text=text,
-                study_plan_id=upload["study_plan_id"],
-                source_pdf_id=pdf_upload_id,
-            )
-            logger.info(f"[Pipeline:{pdf_upload_id}] {len(question_ids)} questões extraídas (com justificativas)")
+            try:
+                question_ids = extract_and_save_questions(
+                    raw_text=text,
+                    study_plan_id=upload["study_plan_id"],
+                    source_pdf_id=pdf_upload_id,
+                    pdf_upload_id=pdf_upload_id,
+                    heartbeat_fn=heartbeat,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Falha na extração de questões: {repr(e)}") from e
 
-            stage = "Salvando no banco"
-            cb.update_heartbeat(pdf_upload_id, 85, stage)
+            _log(pdf_upload_id, "STEP_SUCCESS", f"{len(question_ids)} questões salvas")
+            heartbeat(90, "Finalizando")
+            check_cancel()
 
         elif pdf_type == "syllabus":
-            stage = "Identificando o conteúdo programático"
-            logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-            cb.update_heartbeat(pdf_upload_id, 40, stage)
-            _check_cancel(cb, pdf_upload_id, stage)
-            _check_timeout(started_at, pdf_upload_id, stage)
+            current_stage = "Identificando o conteúdo programático"
+            _log(pdf_upload_id, "STEP_BEGIN", current_stage)
+            heartbeat(40, current_stage)
+            check_cancel()
+            check_timeout()
 
-            extract_and_save_syllabus(text=text, study_plan_id=upload["study_plan_id"])
-            cb.update_heartbeat(pdf_upload_id, 80, "Salvando no banco")
+            try:
+                extract_and_save_syllabus(text=text, study_plan_id=upload["study_plan_id"])
+            except Exception as e:
+                raise RuntimeError(f"Falha na extração do edital: {repr(e)}") from e
 
-        # Concluído
-        stage = "Finalizando"
-        logger.info(f"[Pipeline:{pdf_upload_id}] Concluído com sucesso")
+            heartbeat(88, "Salvando tópicos")
+
+        else:
+            raise ValueError(f"Tipo de PDF desconhecido: '{pdf_type}'")
+
+        # ── CONCLUSÃO ────────────────────────────────────────────────────
+        current_stage = "Concluído"
+        _log(pdf_upload_id, "FINISH", "pipeline concluído com sucesso")
         cb.update_pdf_status(
             pdf_upload_id, "completed",
             progress=100, stage="Concluído",
@@ -134,27 +166,71 @@ def _run_pipeline(pdf_upload_id: str):
 
     except InterruptedError as e:
         msg = str(e)
-        logger.info(f"[Pipeline:{pdf_upload_id}] CANCELADO — {msg}")
-        cb.update_pdf_status(pdf_upload_id, "cancelled", stage="Cancelado pelo usuário", error_message=msg)
+        _log(pdf_upload_id, "FINISH", f"CANCELADO — {msg}")
+        try:
+            cb.update_pdf_status(pdf_upload_id, "cancelled", stage="Cancelado pelo usuário", error_message=msg)
+        except Exception:
+            pass
 
     except TimeoutError as e:
         msg = str(e)
-        logger.error(f"[Pipeline:{pdf_upload_id}] TIMEOUT — {msg}")
-        cb.update_pdf_status(pdf_upload_id, "stalled", stage="Tempo limite excedido", error_message=msg)
+        _log(pdf_upload_id, "FINISH", f"TIMEOUT — {msg}")
+        try:
+            cb.update_pdf_status(pdf_upload_id, "stalled", stage="Tempo limite excedido", error_message=msg)
+        except Exception:
+            pass
 
     except (PDFScannedError, PDFExtractionError) as e:
         msg = repr(e)
-        logger.error(f"[Pipeline:{pdf_upload_id}] ERRO PDF na etapa '{stage}': {msg}")
-        cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro: {stage}", error_message=msg)
+        _log(pdf_upload_id, "STEP_ERROR", f"etapa '{current_stage}': {msg}")
+        try:
+            cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro: {current_stage}", error_message=msg)
+        except Exception:
+            pass
 
     except Exception as e:
         msg = repr(e)
-        logger.error(f"[Pipeline:{pdf_upload_id}] ERRO INESPERADO na etapa '{stage}': {msg}")
-        cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro inesperado: {stage}", error_message=msg)
+        _log(pdf_upload_id, "STEP_ERROR", f"INESPERADO na etapa '{current_stage}': {msg}")
+        try:
+            cb.update_pdf_status(pdf_upload_id, "error", stage=f"Erro inesperado: {current_stage}", error_message=msg)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ #
+# Helpers de resposta                                                   #
+# ------------------------------------------------------------------ #
+
+def _detect_stale(upload: dict, pdf_upload_id: str) -> dict:
+    """Se o job está em processing mas sem heartbeat por STALE_HEARTBEAT_MINUTES, marca stalled."""
+    if upload.get("status") != "processing":
+        return upload
+
+    last_hb = upload.get("last_heartbeat_at")
+    if not last_hb:
+        return upload
+
+    try:
+        hb_time = datetime.fromisoformat(last_hb.replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - hb_time
+        if age > timedelta(minutes=STALE_HEARTBEAT_MINUTES):
+            stage = upload.get("processing_stage", "desconhecida")
+            msg = f"Heartbeat expirou há {int(age.total_seconds())}s na etapa: {stage}"
+            _log(pdf_upload_id, "STALE", msg)
+            try:
+                get_client().update_pdf_status(pdf_upload_id, "stalled", stage="Travado", error_message=msg)
+            except Exception:
+                pass
+            upload = dict(upload)
+            upload["status"] = "stalled"
+            upload["error_message"] = msg
+    except Exception:
+        pass
+
+    return upload
 
 
 def _format_status(upload: dict) -> dict:
-    """Formata o registro do banco no contrato estável para a UI."""
     return {
         "id": upload.get("id"),
         "status": upload.get("status", "pending"),
@@ -173,36 +249,38 @@ def _format_status(upload: dict) -> dict:
 
 @router.post("/pipeline/process")
 def process_pdf(request: ProcessRequest, background_tasks: BackgroundTasks):
-    """Inicia o pipeline em background."""
-    logger.info(f"[Pipeline:{request.pdf_upload_id}] Requisição recebida")
+    _log(request.pdf_upload_id, "START", "requisição recebida")
     background_tasks.add_task(_run_pipeline, request.pdf_upload_id)
     return {"status": "processing", "pdf_upload_id": request.pdf_upload_id}
 
 
 @router.get("/pipeline/status/{pdf_upload_id}")
 def get_pipeline_status(pdf_upload_id: str):
-    """Retorna o status formatado para a UI."""
     upload = get_client().get_pdf_upload(pdf_upload_id)
     if not upload:
         raise HTTPException(status_code=404, detail="pdf_upload_id não encontrado")
+    upload = _detect_stale(upload, pdf_upload_id)
     return _format_status(upload)
 
 
 @router.post("/pipeline/cancel")
 def cancel_pipeline(request: CancelRequest):
-    """Solicita o cancelamento de um job em andamento."""
     upload = get_client().get_pdf_upload(request.pdf_upload_id)
     if not upload:
         raise HTTPException(status_code=404, detail="pdf_upload_id não encontrado")
     if upload.get("status") not in ("pending", "processing"):
-        raise HTTPException(status_code=400, detail=f"Job não pode ser cancelado — status atual: {upload.get('status')}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job não pode ser cancelado — status atual: {upload.get('status')}"
+        )
     get_client().request_cancel(request.pdf_upload_id)
-    logger.info(f"[Pipeline:{request.pdf_upload_id}] Cancelamento solicitado via API")
+    _log(request.pdf_upload_id, "CANCEL", "cancelamento solicitado via API")
     return {"status": "cancel_requested", "pdf_upload_id": request.pdf_upload_id}
 
 
 @router.post("/generate-analysis")
 def generate_analysis(request: GenerateAnalysisRequest):
+    from app.services.ai_analysis import generate_analysis_for_questions
     if not request.question_ids:
         raise HTTPException(status_code=400, detail="question_ids não pode ser vazio")
     return generate_analysis_for_questions(request.question_ids)

@@ -1,14 +1,18 @@
 import json
+import logging
 import re
 import textwrap
-from typing import Any
+import time
+from typing import Any, Callable
 import anthropic
 
 from app.config import get_settings
 from app.services.callback_service import get_client
 
-# Cada chunk ~3000 tokens
+logger = logging.getLogger(__name__)
+
 CHUNK_SIZE = 12_000
+AI_CALL_TIMEOUT = 120.0  # segundos por chamada ao Claude
 
 EXTRACTION_PROMPT = """
 Você é um especialista em concursos públicos brasileiros. Analise o texto abaixo extraído de um PDF de prova.
@@ -75,58 +79,101 @@ def _parse_json(raw: str) -> dict:
 
 
 def _chunk_text(text: str) -> list[str]:
-    # Remove null bytes que o pdfplumber extrai de fontes especiais
     text = text.replace("\x00", " ").replace("\ufffd", "")
     if len(text) <= CHUNK_SIZE:
         return [text]
     return textwrap.wrap(text, CHUNK_SIZE, break_long_words=False, break_on_hyphens=False)
 
 
-def _extract_from_chunk(client: anthropic.Anthropic, chunk: str, model: str) -> list[dict]:
-    response = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        messages=[{"role": "user", "content": EXTRACTION_PROMPT + chunk}],
-    )
-    raw = response.content[0].text if response.content else "{}"
-    data = _parse_json(raw)
-    return data.get("questions", [])
+def _extract_from_chunk(
+    client: anthropic.Anthropic,
+    chunk: str,
+    model: str,
+    chunk_idx: int,
+    total_chunks: int,
+    pdf_upload_id: str,
+) -> list[dict]:
+    logger.info(f"[Extraction:{pdf_upload_id}] STEP_BEGIN chunk {chunk_idx+1}/{total_chunks} ({len(chunk)} chars)")
+    t0 = time.time()
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            timeout=AI_CALL_TIMEOUT,
+            messages=[{"role": "user", "content": EXTRACTION_PROMPT + chunk}],
+        )
+    except anthropic.APITimeoutError:
+        logger.error(f"[Extraction:{pdf_upload_id}] STEP_ERROR chunk {chunk_idx+1} — timeout após {AI_CALL_TIMEOUT}s")
+        raise RuntimeError(f"Timeout na chamada ao Claude (chunk {chunk_idx+1}/{total_chunks})")
+    except anthropic.APIError as e:
+        logger.error(f"[Extraction:{pdf_upload_id}] STEP_ERROR chunk {chunk_idx+1} — API error: {e}")
+        raise RuntimeError(f"Erro na API Claude (chunk {chunk_idx+1}): {e}")
+
+    raw = response.content[0].text if response.content else ""
+    if not raw.strip():
+        logger.warning(f"[Extraction:{pdf_upload_id}] chunk {chunk_idx+1} retornou resposta vazia")
+        return []
+
+    try:
+        data = _parse_json(raw)
+        questions = data.get("questions", [])
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"[Extraction:{pdf_upload_id}] STEP_ERROR chunk {chunk_idx+1} — JSON inválido: {e} | raw[:200]={raw[:200]}")
+        return []
+
+    elapsed = time.time() - t0
+    logger.info(f"[Extraction:{pdf_upload_id}] STEP_SUCCESS chunk {chunk_idx+1} — {len(questions)} questões em {elapsed:.1f}s")
+    return questions
 
 
 def extract_and_save_questions(
     raw_text: str,
     study_plan_id: str,
     source_pdf_id: str,
+    pdf_upload_id: str = "",
+    heartbeat_fn: Callable[[int, str], None] | None = None,
 ) -> list[str]:
     """
-    Extrai questões, justificativas e peguinhas do texto bruto em uma única passagem de IA.
-    Retorna lista de IDs das questões criadas.
+    Extrai questões, justificativas e peguinhas do texto em uma única passagem de IA.
+    Chama heartbeat_fn(progress, stage) entre chunks para manter o job vivo.
     """
     settings = get_settings()
     ai_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     cb = get_client()
 
     chunks = _chunk_text(raw_text)
+    total = len(chunks)
     all_questions: list[dict[str, Any]] = []
 
+    logger.info(f"[Extraction:{pdf_upload_id}] START — {total} chunks, {len(raw_text)} chars totais")
+
     for i, chunk in enumerate(chunks):
-        questions = _extract_from_chunk(ai_client, chunk, settings.ai_model)
+        # Heartbeat antes de cada chamada de IA
+        if heartbeat_fn:
+            progress = 35 + int((i / total) * 45)  # 35% → 80%
+            heartbeat_fn(progress, f"Identificando questões ({i+1}/{total})")
+
+        questions = _extract_from_chunk(ai_client, chunk, settings.ai_model, i, total, pdf_upload_id)
         all_questions.extend(questions)
+
+    logger.info(f"[Extraction:{pdf_upload_id}] Extração concluída — {len(all_questions)} questões totais")
 
     if not all_questions:
         return []
 
+    if heartbeat_fn:
+        heartbeat_fn(82, "Salvando questões no banco")
+
     subject_cache: dict[str, str] = {}
     question_ids: list[str] = []
 
-    for q in all_questions:
+    for idx, q in enumerate(all_questions):
         topic = q.get("topic", "Geral")
 
-        # Busca ou cria disciplina
         if topic not in subject_cache:
             subject_cache[topic] = cb.upsert_subject(topic, study_plan_id)
 
-        # Insere questão
         ids = cb.insert_questions(
             [{
                 "subject_id": subject_cache[topic],
@@ -144,7 +191,6 @@ def extract_and_save_questions(
         question_id = ids[0]
         question_ids.append(question_id)
 
-        # Insere justificativas extraídas do PDF (não geradas por IA)
         justifications = [
             {
                 "question_id": question_id,
@@ -158,7 +204,6 @@ def extract_and_save_questions(
         if justifications:
             cb.insert_justifications(justifications)
 
-        # Insere peguinhas extraídas do PDF
         tricky_points = [
             {
                 "question_id": question_id,
@@ -172,4 +217,10 @@ def extract_and_save_questions(
         if tricky_points:
             cb.insert_tricky_points(tricky_points)
 
+        # Heartbeat a cada 10 questões salvas
+        if heartbeat_fn and (idx + 1) % 10 == 0:
+            progress = 82 + int(((idx + 1) / len(all_questions)) * 8)
+            heartbeat_fn(progress, f"Salvando questões ({idx+1}/{len(all_questions)})")
+
+    logger.info(f"[Extraction:{pdf_upload_id}] FINISH — {len(question_ids)} questões salvas")
     return question_ids
