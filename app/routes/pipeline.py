@@ -108,20 +108,10 @@ def _run_pipeline(pdf_upload_id: str):
                 study_plan_id=upload["study_plan_id"],
                 source_pdf_id=pdf_upload_id,
             )
-            logger.info(f"[Pipeline:{pdf_upload_id}] {len(question_ids)} questões extraídas")
+            logger.info(f"[Pipeline:{pdf_upload_id}] {len(question_ids)} questões extraídas (com justificativas)")
 
             stage = "Salvando no banco"
-            cb.update_heartbeat(pdf_upload_id, 65, stage)
-            _check_cancel(cb, pdf_upload_id, stage)
-            _check_timeout(started_at, pdf_upload_id, stage)
-
-            if question_ids:
-                stage = "Gerando análises"
-                logger.info(f"[Pipeline:{pdf_upload_id}] {stage}")
-                cb.update_heartbeat(pdf_upload_id, 80, stage)
-                _check_cancel(cb, pdf_upload_id, stage)
-                _check_timeout(started_at, pdf_upload_id, stage)
-                generate_analysis_for_questions(question_ids)
+            cb.update_heartbeat(pdf_upload_id, 85, stage)
 
         elif pdf_type == "syllabus":
             stage = "Identificando o conteúdo programático"
