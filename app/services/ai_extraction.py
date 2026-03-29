@@ -495,6 +495,10 @@ def save_parsed_questions(
     # o image_service usa esse mesmo número como chave do mapa.
     q_image_map: dict[int, list[dict]] = {}
     if pdf_bytes and user_id:
+        logger.info(
+            f"[SaveParsed:{pdf_upload_id}] iniciando extração de imagens "
+            f"({len(pdf_bytes)} bytes, user_id={user_id!r})"
+        )
         try:
             from app.services.image_service import extract_question_images
             if heartbeat_fn:
@@ -506,14 +510,22 @@ def save_parsed_questions(
                 user_id=user_id,
                 cb=cb,
             )
+            total_imgs = sum(len(v) for v in q_image_map.values())
             logger.info(
-                f"[SaveParsed:{pdf_upload_id}] imagens em {len(q_image_map)} questões"
+                f"[SaveParsed:{pdf_upload_id}] imagens: "
+                f"{total_imgs} em {len(q_image_map)} questões — mapa={list(q_image_map.keys())}"
             )
         except Exception as img_err:
             logger.warning(
                 f"[SaveParsed:{pdf_upload_id}] extração de imagens falhou "
                 f"(não bloqueante): {img_err}"
             )
+    else:
+        logger.info(
+            f"[SaveParsed:{pdf_upload_id}] extração de imagens PULADA — "
+            f"pdf_bytes={'vazio' if not pdf_bytes else f'{len(pdf_bytes)}B'} "
+            f"user_id={user_id!r}"
+        )
 
     if heartbeat_fn:
         heartbeat_fn(55, f"Inserindo {total} questões no banco")

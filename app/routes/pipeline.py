@@ -103,11 +103,23 @@ def _run_pipeline(pdf_upload_id: str):
         heartbeat(25, current_stage)
 
         cached_text = upload.get("text_content", "")
-        pdf_bytes: bytes = b""   # disponível apenas no download (não no cache)
+        pdf_bytes: bytes = b""
 
         if cached_text and len(cached_text) > 100:
             text = cached_text
-            _log(pdf_upload_id, "STEP_SUCCESS", f"texto em cache: {len(text)} chars — download ignorado")
+            _log(pdf_upload_id, "STEP_SUCCESS", f"texto em cache: {len(text)} chars")
+
+            # Texto em cache mas bytes do PDF são necessários para extração de imagens.
+            # Faz um segundo download não-bloqueante apenas para obter os bytes.
+            if pdf_type == "exam":
+                try:
+                    _, pdf_bytes = download_and_extract_text(file_path)
+                    _log(pdf_upload_id, "IMG_PREP", f"PDF baixado para imagens: {len(pdf_bytes)} bytes")
+                except Exception as dl_err:
+                    logger.warning(
+                        f"[{pdf_upload_id}] download extra para imagens falhou "
+                        f"(não bloqueante): {dl_err}"
+                    )
         else:
             try:
                 text, pdf_bytes = download_and_extract_text(file_path)
@@ -128,6 +140,9 @@ def _run_pipeline(pdf_upload_id: str):
 
         # Extrai user_id do file_path (formato esperado: "{user_id}/nome.pdf")
         user_id = file_path.split("/")[0] if "/" in file_path else ""
+        _log(pdf_upload_id, "IMG_PREP",
+             f"pdf_bytes={len(pdf_bytes)}B  user_id={user_id!r}  "
+             f"imagens={'habilitado' if pdf_bytes and user_id else 'desabilitado (bytes vazio ou user_id vazio)'}")
 
         check_cancel()
         check_timeout()

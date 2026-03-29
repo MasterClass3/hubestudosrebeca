@@ -95,14 +95,24 @@ def extract_question_images(
         {numero_questao: [{"url": caminho, "order": idx, "description": ""}]}
         Retorna {} silenciosamente em caso de erro (não-bloqueante).
     """
+    tag = f"[ImageService:{pdf_upload_id}]"
+
     if not pdf_bytes:
+        logger.info(f"{tag} pdf_bytes vazio — extração de imagens ignorada")
         return {}
+
+    if not user_id:
+        logger.info(f"{tag} user_id vazio — extração de imagens ignorada")
+        return {}
+
+    logger.info(f"{tag} iniciando — {len(pdf_bytes)} bytes | study_plan={study_plan_id}")
 
     try:
         import fitz  # PyMuPDF
+        logger.info(f"{tag} PyMuPDF versão {fitz.version}")
     except ImportError:
         logger.warning(
-            "[ImageService] pymupdf não instalado — extração de imagens desabilitada. "
+            f"{tag} pymupdf não instalado — extração de imagens desabilitada. "
             "Instale com: pip install pymupdf"
         )
         return {}
@@ -110,26 +120,36 @@ def extract_question_images(
     # ── Passo 1: abrir PDF e extrair posições das questões ────────────────
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        logger.info(f"{tag} PDF aberto — {len(doc)} páginas")
     except Exception as e:
-        logger.error(f"[ImageService:{pdf_upload_id}] Falha ao abrir PDF com fitz: {e}")
+        logger.error(f"{tag} Falha ao abrir PDF com fitz: {e}")
         return {}
 
     try:
+        # ── Passo 1: posições das questões ────────────────────────────────
         q_positions = _find_question_positions(doc)
         total_markers = sum(len(v) for v in q_positions.values())
         logger.info(
-            f"[ImageService:{pdf_upload_id}] "
-            f"{total_markers} marcadores de questão em {len(q_positions)} páginas"
+            f"{tag} Passo 1 — {total_markers} marcadores de questão "
+            f"em {len(q_positions)} páginas: "
+            f"{dict(list(q_positions.items())[:3])}"
         )
 
         # ── Passo 2: extrair imagens com posições ─────────────────────────
         raw_images = _extract_raw_images(doc)
         logger.info(
-            f"[ImageService:{pdf_upload_id}] "
-            f"{len(raw_images)} imagens extraídas (≥{_MIN_W}×{_MIN_H}px)"
+            f"{tag} Passo 2 — {len(raw_images)} imagens extraídas "
+            f"(filtro ≥{_MIN_W}×{_MIN_H}px)"
         )
 
         if not raw_images:
+            # Conta o total bruto antes do filtro para diagnóstico
+            total_raw = sum(len(doc[p].get_images(full=True)) for p in range(len(doc)))
+            logger.info(
+                f"{tag} Nenhuma imagem após filtro de tamanho. "
+                f"Total bruto no PDF (sem filtro): {total_raw}. "
+                f"Provável causa: tabelas são texto formatado, não imagens embutidas."
+            )
             doc.close()
             return {}
 
@@ -138,10 +158,19 @@ def extract_question_images(
         for img in raw_images:
             q_num = _assign_to_question(img.page_num, img.y0, q_positions)
             q_images.setdefault(q_num, []).append(img)
+            logger.debug(
+                f"{tag} Imagem xref={img.xref} página={img.page_num} "
+                f"y0={img.y0:.0f} → questão {q_num} ({img.width}×{img.height}px .{img.ext})"
+            )
+
+        logger.info(
+            f"{tag} Passo 3 — {len(raw_images)} imagens associadas a "
+            f"{len(q_images)} questões: {list(q_images.keys())}"
+        )
 
         doc.close()
     except Exception as e:
-        logger.error(f"[ImageService:{pdf_upload_id}] Erro durante extração: {e}")
+        logger.error(f"{tag} Erro durante extração: {e}", exc_info=True)
         try:
             doc.close()
         except Exception:
@@ -169,6 +198,7 @@ def extract_question_images(
         q_num, idx, img, path = task
         try:
             _upload_image(cb, path, img.image_bytes, img.ext)
+            logger.info(f"{tag} Upload OK → q={q_num} idx={idx} path={path} ({len(img.image_bytes)} bytes)")
             with result_lock:
                 result.setdefault(q_num, []).append({
                     "url": path,
@@ -177,8 +207,7 @@ def extract_question_images(
                 })
         except Exception as up_err:
             logger.warning(
-                f"[ImageService:{pdf_upload_id}] "
-                f"Upload falhou q={q_num} idx={idx} path={path}: {up_err}"
+                f"{tag} Upload FALHOU q={q_num} idx={idx} path={path}: {up_err}"
             )
 
     with ThreadPoolExecutor(max_workers=parallelism) as executor:
