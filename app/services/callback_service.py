@@ -125,16 +125,33 @@ class SupabaseCallbackClient:
     # ------------------------------------------------------------------ #
 
     def upsert_subject(self, name: str, study_plan_id: str) -> str:
+        # 1. Tenta ler subject existente
         rows = self.read("subjects", {"study_plan_id": study_plan_id, "name": name})
         if rows:
             first = rows[0] if isinstance(rows, list) else rows
-            return first["id"]
+            subject_id = first.get("id")
+            if subject_id:
+                return subject_id
+
+        # 2. Insere novo subject
         result = self.call("insert_subjects", {"subjects": [{"study_plan_id": study_plan_id, "name": name}]})
         data = result.get("data", []) if isinstance(result, dict) else []
         if data:
             first = data[0] if isinstance(data, list) else data
-            return first["id"]
-        raise RuntimeError(f"Falha ao criar disciplina '{name}'")
+            subject_id = (first or {}).get("id")
+            if subject_id:
+                return subject_id
+
+        # 3. Read-after-write: Edge Function pode não retornar "id" no insert
+        #    (Supabase .insert() sem .select() retorna null — buscamos direto)
+        rows = self.read("subjects", {"study_plan_id": study_plan_id, "name": name})
+        if rows:
+            first = rows[0] if isinstance(rows, list) else rows
+            subject_id = first.get("id")
+            if subject_id:
+                return subject_id
+
+        raise RuntimeError(f"Falha ao criar disciplina '{name}' — id não encontrado após insert")
 
     def insert_questions(self, questions: list, study_plan_id: str, source_pdf_id: str) -> list[str]:
         for q in questions:
