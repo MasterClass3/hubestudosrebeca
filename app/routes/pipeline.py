@@ -10,7 +10,7 @@ from app.services.callback_service import get_client
 from app.services.pdf_service import download_and_extract_text, PDFExtractionError, PDFScannedError
 from app.services.ai_extraction import extract_and_save_questions, save_parsed_questions
 from app.services.syllabus_service import extract_and_save_syllabus
-from app.services.smart_parser import is_structured_exam, parse_structured_exam
+from app.services.smart_parser import is_structured_exam, parse_structured_exam, _extract_meta
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -183,6 +183,16 @@ def _run_pipeline(pdf_upload_id: str):
                         )
                 else:
                     # ── Caminho padrão: extração via IA ──────────────────
+                    # Tenta extrair metadados mesmo sem estrutura detectada
+                    # (cabeçalhos "Ano:", "Banca:", "Órgão:", "Prova:" podem estar presentes)
+                    try:
+                        ai_meta = _extract_meta(text)
+                        if ai_meta.concurso_name and ai_meta.concurso_name != "Concurso Importado":
+                            _log(pdf_upload_id, "META", f"concurso (IA path)='{ai_meta.concurso_name}'")
+                            cb.update_pdf_concurso_name(pdf_upload_id, ai_meta.concurso_name)
+                    except Exception as meta_err:
+                        logger.warning(f"[{pdf_upload_id}] _extract_meta (IA path) falhou (não bloqueante): {meta_err}")
+
                     question_ids = extract_and_save_questions(
                         raw_text=text,
                         study_plan_id=upload["study_plan_id"],

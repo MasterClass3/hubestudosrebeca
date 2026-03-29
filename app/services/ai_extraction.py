@@ -445,7 +445,7 @@ def save_parsed_questions(
     # ── Batch insert de questões ──────────────────────────────────────────
     questions_payload = [
         {
-            "subject_id": subject_cache.get(q.topic, ""),
+            "subject_id": subject_cache.get(q.topic) or None,   # None (não "") para FK válida
             "statement": q.statement,
             "alternatives": q.alternatives,
             "correct_answer": q.correct_answer,
@@ -454,6 +454,12 @@ def save_parsed_questions(
         }
         for q in parsed_questions
     ]
+    logger.info(
+        f"[SaveParsed:{pdf_upload_id}] payload amostra — "
+        f"subject_id={questions_payload[0].get('subject_id')!r} "
+        f"topic={questions_payload[0].get('topic')!r} "
+        f"source_pdf_id será={source_pdf_id!r}"
+    )
     question_ids = cb.insert_questions(questions_payload, study_plan_id, source_pdf_id)
 
     if not question_ids:
