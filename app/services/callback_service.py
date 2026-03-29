@@ -43,7 +43,12 @@ class SupabaseCallbackClient:
         """Retorna o registro completo de pdf_uploads pelo id."""
         result = self.call("read", {"table": "pdf_uploads", "filters": {"id": pdf_upload_id}})
         rows = result.get("data", result) if isinstance(result, dict) else result
-        return rows[0] if rows else {}
+        # Protege contra Edge Function devolver dict direto em vez de list
+        if isinstance(rows, list):
+            return rows[0] if rows else {}
+        if isinstance(rows, dict):
+            return rows
+        return {}
 
     def get_questions(self, study_plan_id: str) -> list:
         result = self.call("read", {"table": "questions", "filters": {"study_plan_id": study_plan_id}})
@@ -79,6 +84,7 @@ class SupabaseCallbackClient:
         error_message: str | None = None,
         processing_started_at: str | None = None,
         completed_at: str | None = None,
+        questions_count: int | None = None,
     ):
         """
         Muda o status do job (processing, completed, error, cancelled, stalled).
@@ -95,6 +101,8 @@ class SupabaseCallbackClient:
             data["processing_started_at"] = processing_started_at
         if completed_at is not None:
             data["completed_at"] = completed_at
+        if questions_count is not None:
+            data["questions_count"] = questions_count
         return self.call("update_pdf_status", data)
 
     def update_heartbeat(self, pdf_id: str, progress: int, stage: str):
@@ -119,11 +127,13 @@ class SupabaseCallbackClient:
     def upsert_subject(self, name: str, study_plan_id: str) -> str:
         rows = self.read("subjects", {"study_plan_id": study_plan_id, "name": name})
         if rows:
-            return rows[0]["id"]
+            first = rows[0] if isinstance(rows, list) else rows
+            return first["id"]
         result = self.call("insert_subjects", {"subjects": [{"study_plan_id": study_plan_id, "name": name}]})
         data = result.get("data", []) if isinstance(result, dict) else []
         if data:
-            return data[0]["id"]
+            first = data[0] if isinstance(data, list) else data
+            return first["id"]
         raise RuntimeError(f"Falha ao criar disciplina '{name}'")
 
     def insert_questions(self, questions: list, study_plan_id: str, source_pdf_id: str) -> list[str]:
@@ -145,6 +155,24 @@ class SupabaseCallbackClient:
         for t in topics:
             t.setdefault("study_plan_id", study_plan_id)
         return self.call("insert_syllabus_topics", {"topics": topics})
+
+    # ------------------------------------------------------------------ #
+    # Storage                                                               #
+    # ------------------------------------------------------------------ #
+
+    def save_text_content(self, pdf_upload_id: str, text: str):
+        """Persiste o texto extraído do PDF em pdf_uploads.text_content para reuso."""
+        return self.call("save_text_content", {"pdf_id": pdf_upload_id, "text_content": text})
+
+    def update_pdf_concurso_name(self, pdf_id: str, concurso_name: str):
+        """
+        Salva o nome do concurso (sem a banca) em pdf_uploads.concurso_name.
+        Usado pelo smart parser para preencher o nome de exibição.
+        """
+        return self.call("update_pdf_status", {
+            "pdf_id": pdf_id,
+            "concurso_name": concurso_name,
+        })
 
     # ------------------------------------------------------------------ #
     # Storage                                                               #

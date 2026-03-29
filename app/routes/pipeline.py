@@ -1,5 +1,6 @@
 import logging
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -7,8 +8,9 @@ from pydantic import BaseModel
 
 from app.services.callback_service import get_client
 from app.services.pdf_service import download_and_extract_text, PDFExtractionError, PDFScannedError
-from app.services.ai_extraction import extract_and_save_questions
+from app.services.ai_extraction import extract_and_save_questions, save_parsed_questions
 from app.services.syllabus_service import extract_and_save_syllabus
+from app.services.smart_parser import is_structured_exam, parse_structured_exam
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -95,46 +97,114 @@ def _run_pipeline(pdf_upload_id: str):
         file_path = upload.get("file_path", "")
         _log(pdf_upload_id, "STEP_BEGIN", f"file_path='{file_path}'")
 
-        # ── ETAPA 3: baixar PDF e extrair texto ──────────────────────────
+        # ── ETAPA 3: baixar PDF e extrair texto (com cache) ──────────────
         current_stage = "Lendo o conteúdo"
         _log(pdf_upload_id, "STEP_BEGIN", current_stage)
         heartbeat(25, current_stage)
 
-        try:
-            text = download_and_extract_text(file_path)
-        except PDFScannedError as e:
-            raise PDFScannedError(e) from e
-        except PDFExtractionError as e:
-            raise PDFExtractionError(e) from e
-        except Exception as e:
-            raise RuntimeError(f"Falha ao ler PDF: {repr(e)}") from e
+        cached_text = upload.get("text_content", "")
+        if cached_text and len(cached_text) > 100:
+            text = cached_text
+            _log(pdf_upload_id, "STEP_SUCCESS", f"texto em cache: {len(text)} chars — download ignorado")
+        else:
+            try:
+                text = download_and_extract_text(file_path)
+            except PDFScannedError as e:
+                raise PDFScannedError(e) from e
+            except PDFExtractionError as e:
+                raise PDFExtractionError(e) from e
+            except Exception as e:
+                raise RuntimeError(f"Falha ao ler PDF: {repr(e)}") from e
 
-        _log(pdf_upload_id, "STEP_SUCCESS", f"texto extraído: {len(text)} chars")
+            _log(pdf_upload_id, "STEP_SUCCESS", f"texto extraído: {len(text)} chars")
+
+            # Persiste para reprocessamentos futuros (best-effort)
+            try:
+                cb.save_text_content(pdf_upload_id, text)
+            except Exception as cache_err:
+                logger.warning(f"[{pdf_upload_id}] save_text_content falhou (não bloqueante): {cache_err}")
         check_cancel()
         check_timeout()
 
         pdf_type = upload.get("type")
 
         if pdf_type == "exam":
-            # ── ETAPA 4: identificar questões (loop com heartbeats) ──────
+            # ── ETAPA 4: identificar questões ────────────────────────────
             current_stage = "Identificando as questões"
             _log(pdf_upload_id, "STEP_BEGIN", current_stage)
             heartbeat(35, current_stage)
             check_cancel()
             check_timeout()
 
+            # ── Diagnóstico: amostra do texto e detecção de formato ──────
+            _log(pdf_upload_id, "DIAG", f"Tamanho total do texto: {len(text)} chars")
+            _log(pdf_upload_id, "DIAG", f"Amostra (500 chars): {repr(text[:500])}")
+            _structured = is_structured_exam(text)
+            _log(pdf_upload_id, "DIAG", f"is_structured_exam={_structured}")
+
             try:
-                question_ids = extract_and_save_questions(
-                    raw_text=text,
-                    study_plan_id=upload["study_plan_id"],
-                    source_pdf_id=pdf_upload_id,
-                    pdf_upload_id=pdf_upload_id,
-                    heartbeat_fn=heartbeat,
-                )
+                if _structured:
+                    # ── Caminho rápido: smart parser (extração por regex) ─
+                    heartbeat(36, "Prova estruturada detectada — extraindo questões")
+                    _log(pdf_upload_id, "STEP_BEGIN", "smart_parser")
+
+                    meta, parsed_qs = parse_structured_exam(text)
+                    _log(pdf_upload_id, "DIAG", f"smart_parser extraiu {len(parsed_qs)} questões")
+
+                    if meta.concurso_name:
+                        _log(pdf_upload_id, "META", f"concurso='{meta.concurso_name}'")
+                        heartbeat(37, f"Concurso: {meta.concurso_name[:70]}")
+                        try:
+                            cb.update_pdf_concurso_name(pdf_upload_id, meta.concurso_name)
+                        except Exception as meta_err:
+                            logger.warning(
+                                f"[{pdf_upload_id}] update_pdf_concurso_name falhou "
+                                f"(não bloqueante): {meta_err}"
+                            )
+
+                    if not parsed_qs:
+                        _log(pdf_upload_id, "WARN", "Smart parser não extraiu questões — usando IA")
+                        heartbeat(38, "Usando IA para extração")
+                        question_ids = extract_and_save_questions(
+                            raw_text=text,
+                            study_plan_id=upload["study_plan_id"],
+                            source_pdf_id=pdf_upload_id,
+                            pdf_upload_id=pdf_upload_id,
+                            heartbeat_fn=heartbeat,
+                        )
+                    else:
+                        heartbeat(38, f"{len(parsed_qs)} questões identificadas")
+                        question_ids = save_parsed_questions(
+                            parsed_questions=parsed_qs,
+                            study_plan_id=upload["study_plan_id"],
+                            source_pdf_id=pdf_upload_id,
+                            pdf_upload_id=pdf_upload_id,
+                            heartbeat_fn=heartbeat,
+                        )
+                else:
+                    # ── Caminho padrão: extração via IA ──────────────────
+                    question_ids = extract_and_save_questions(
+                        raw_text=text,
+                        study_plan_id=upload["study_plan_id"],
+                        source_pdf_id=pdf_upload_id,
+                        pdf_upload_id=pdf_upload_id,
+                        heartbeat_fn=heartbeat,
+                    )
+
             except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"[{pdf_upload_id}] TRACEBACK extração:\n{tb}")
+                _log(pdf_upload_id, "DIAG", f"Texto nas primeiras 1000 chars: {repr(text[:1000])}")
                 raise RuntimeError(f"Falha na extração de questões: {repr(e)}") from e
 
             _log(pdf_upload_id, "STEP_SUCCESS", f"{len(question_ids)} questões salvas")
+            try:
+                cb.update_pdf_status(
+                    pdf_upload_id, "processing",
+                    questions_count=len(question_ids),
+                )
+            except Exception:
+                pass
             heartbeat(90, "Finalizando")
             check_cancel()
 
@@ -231,6 +301,8 @@ def _detect_stale(upload: dict, pdf_upload_id: str) -> dict:
 
 
 def _format_status(upload: dict) -> dict:
+    is_completed = upload.get("status") == "completed"
+    study_plan_id = upload.get("study_plan_id")
     return {
         "id": upload.get("id"),
         "status": upload.get("status", "pending"),
@@ -240,6 +312,11 @@ def _format_status(upload: dict) -> dict:
         "cancel_requested": upload.get("cancel_requested", False),
         "last_heartbeat_at": upload.get("last_heartbeat_at"),
         "completed_at": upload.get("completed_at"),
+        # Metadados do concurso (preenchidos pelo smart parser)
+        "concurso_name": upload.get("concurso_name"),
+        "questions_count": upload.get("questions_count"),
+        # Indica para onde o frontend deve redirecionar ao completar
+        "redirect_to": f"/plans/{study_plan_id}" if is_completed and study_plan_id else None,
     }
 
 

@@ -94,6 +94,81 @@ pytest tests/ -v
 
 Execute no SQL Editor do Supabase:
 
+### Migration — campos de progresso e cache de texto
+
+Execute **após** criar as tabelas base:
+
+```sql
+-- Campos de progresso granular (pipeline escalável)
+alter table pdf_uploads
+  add column if not exists progress int default 0,
+  add column if not exists processing_stage text,
+  add column if not exists last_heartbeat_at timestamptz,
+  add column if not exists processing_started_at timestamptz,
+  add column if not exists completed_at timestamptz,
+  add column if not exists cancel_requested boolean default false,
+  -- Cache de texto extraído (evita re-download/OCR em reprocessamentos)
+  add column if not exists text_content text,
+  -- Nome do concurso extraído pelo parser (sem expor a banca)
+  -- Ex: "Câmara de Goiânia - GO - Revisor de Texto (2026)"
+  add column if not exists concurso_name text,
+  -- Quantidade de questões extraídas (preenchido ao completar)
+  add column if not exists questions_count int;
+```
+
+### Suporte na Edge Function `process-callback`
+
+Além de `save_text_content`, adicione o campo `concurso_name` ao handler `update_pdf_status`:
+
+```typescript
+// No case "update_pdf_status", aceitar o campo concurso_name
+case "update_pdf_status": {
+  const {
+    pdf_id, status, progress, processing_stage, error_message,
+    processing_started_at, completed_at, cancel_requested,
+    concurso_name,        // ← NOVO: nome do concurso sem banca
+    questions_count,      // ← NOVO: contagem de questões
+  } = data;
+
+  const update: Record<string, unknown> = {};
+  if (status !== undefined)               update.status = status;
+  if (progress !== undefined)             update.progress = progress;
+  if (processing_stage !== undefined)     update.processing_stage = processing_stage;
+  if (error_message !== undefined)        update.error_message = error_message;
+  if (processing_started_at !== undefined) update.processing_started_at = processing_started_at;
+  if (completed_at !== undefined)         update.completed_at = completed_at;
+  if (cancel_requested !== undefined)     update.cancel_requested = cancel_requested;
+  if (concurso_name !== undefined)        update.concurso_name = concurso_name;
+  if (questions_count !== undefined)      update.questions_count = questions_count;
+
+  await supabase.from("pdf_uploads").update(update).eq("id", pdf_id);
+  return { ok: true };
+}
+
+// action: "save_text_content"
+case "save_text_content": {
+  const { pdf_id, text_content } = data;
+  await supabase.from("pdf_uploads").update({ text_content }).eq("id", pdf_id);
+  return { ok: true };
+}
+```
+
+Suporte ao campo `save_text_content` na Edge Function `process-callback`:
+```typescript
+// action: "save_text_content"
+case "save_text_content": {
+  const { pdf_id, text_content } = data;
+  await supabase.from("pdf_uploads").update({ text_content }).eq("id", pdf_id);
+  return { ok: true };
+}
+```
+
+---
+
+## Schema Supabase
+
+Execute no SQL Editor do Supabase:
+
 ```sql
 -- Tabela de uploads
 create table pdf_uploads (
