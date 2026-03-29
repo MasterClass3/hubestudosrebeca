@@ -39,11 +39,12 @@ _IMAGE_REF_WORDS = [
     "de acordo com a figura", "segundo a tabela", "segundo o gráfico",
 ]
 
-# Padrões de numeração de questão (mesmos usados pelo smart_parser)
+# Padrões de numeração de questão (limpos de null bytes antes de testar)
 _Q_NUM_PATTERNS = [
     re.compile(r"(?:Quest[aã]o|QUEST[AÃ]O)\s+(\d{1,3})"),  # "Questão 12"
-    re.compile(r"(?m)^[ \t]*(\d{1,3})[.)]\s"),              # "12. " ou "12) "
-    re.compile(r"^\((\d{1,3})\)\s"),                        # "(12) "
+    re.compile(r"^[ \t]*(\d{1,3})[.)]\s"),                   # "12. " ou "12) " início de linha
+    re.compile(r"^\((\d{1,3})\)\s"),                         # "(12) " início de linha
+    re.compile(r"^[ \t]*(\d{1,3})[ \t]+Q\d{5,}"),           # "1 Q3942431" (Qconcursos)
 ]
 
 # Tipos MIME por extensão
@@ -153,18 +154,35 @@ def extract_question_images(
             doc.close()
             return {}
 
+        # ── Guarda-chuva: sem posições de questão → não desperdiçar uploads ─
+        if not q_positions:
+            logger.warning(
+                f"{tag} Posições de questão não detectadas — as {len(raw_images)} imagens "
+                f"encontradas são provavelmente logos/cabeçalhos decorativos. "
+                f"Imagens não serão associadas a questões."
+            )
+            doc.close()
+            return {}
+
         # ── Passo 3: associar imagens às questões ─────────────────────────
         q_images: dict[int, list[_RawImage]] = {}
         for img in raw_images:
             q_num = _assign_to_question(img.page_num, img.y0, q_positions)
+            if q_num == 0:
+                logger.debug(
+                    f"{tag} Imagem xref={img.xref} p{img.page_num} y0={img.y0:.0f} "
+                    f"→ q_num=0 (não associada a nenhuma questão) — ignorada"
+                )
+                continue   # descarta imagens que não foram associadas a nenhuma questão
             q_images.setdefault(q_num, []).append(img)
             logger.debug(
-                f"{tag} Imagem xref={img.xref} página={img.page_num} "
+                f"{tag} Imagem xref={img.xref} p{img.page_num} "
                 f"y0={img.y0:.0f} → questão {q_num} ({img.width}×{img.height}px .{img.ext})"
             )
 
         logger.info(
-            f"{tag} Passo 3 — {len(raw_images)} imagens associadas a "
+            f"{tag} Passo 3 — {len(raw_images)} imagens, "
+            f"{sum(len(v) for v in q_images.values())} associadas a "
             f"{len(q_images)} questões: {list(q_images.keys())}"
         )
 
@@ -242,10 +260,14 @@ def _find_question_positions(doc) -> dict[int, list[tuple[float, int]]]:
     """
     Percorre cada página e localiza onde cada questão começa (pelo número).
 
+    Limpa null bytes (\x00) antes de testar padrões — comum em PDFs do Qconcursos
+    onde o número da questão é renderizado com fonte especial (ex: "Questão\x001").
+
     Returns:
         {page_num: [(y0, q_num), ...]}  — ordenado por y0 dentro de cada página
     """
     positions: dict[int, list[tuple[float, int]]] = {}
+    sample_lines: list[str] = []   # primeiras linhas para diagnóstico
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -260,9 +282,15 @@ def _find_question_positions(doc) -> dict[int, list[tuple[float, int]]]:
             if block.get("type") != 0:     # 0 = bloco de texto
                 continue
             for line in block.get("lines", []):
-                line_text = " ".join(
+                raw_text = " ".join(
                     span.get("text", "") for span in line.get("spans", [])
                 )
+                # Limpa null bytes — artefato de fontes customizadas em PDFs de concurso
+                line_text = raw_text.replace("\x00", " ").replace("\ufffd", "").strip()
+
+                if len(sample_lines) < 20 and line_text:
+                    sample_lines.append(f"p{page_num}:{line_text[:80]}")
+
                 for pat in _Q_NUM_PATTERNS:
                     m = pat.search(line_text)
                     if m:
@@ -277,11 +305,17 @@ def _find_question_positions(doc) -> dict[int, list[tuple[float, int]]]:
                         seen_q_on_page.add(q_num)
                         y0 = line["bbox"][1]  # topo da linha
                         positions.setdefault(page_num, []).append((y0, q_num))
-                        break  # encontrou padrão nesta linha — passa para próxima
+                        break
 
     # Ordena por posição Y dentro de cada página
     for page_num in positions:
         positions[page_num].sort(key=lambda t: t[0])
+
+    if not positions:
+        logger.info(
+            f"[ImageService] _find_question_positions: nenhum marcador encontrado. "
+            f"Amostra das primeiras linhas do PDF: {sample_lines[:10]}"
+        )
 
     return positions
 
