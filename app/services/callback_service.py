@@ -227,6 +227,33 @@ class SupabaseCallbackClient:
     # Storage                                                               #
     # ------------------------------------------------------------------ #
 
+    def get_signed_upload_url(self, file_path: str, bucket: str = "pdfs") -> str:
+        """
+        Solicita uma signed URL de UPLOAD para o Supabase Storage.
+        Usa a action 'get_signed_upload_url' da Edge Function.
+
+        Returns:
+            signed_url — URL para fazer PUT com os bytes da imagem
+        """
+        result = self.call("get_signed_upload_url", {
+            "file_path": file_path,
+            "bucket": bucket,
+        })
+        # Resposta esperada: {"success": true, "data": {"signed_url": "...", "token": "...", "path": "..."}}
+        data = result.get("data") or {}
+        signed_url = (
+            data.get("signed_url")
+            or data.get("signedUrl")
+            or result.get("signed_url")
+            or result.get("signedUrl")
+        )
+        if not signed_url:
+            raise RuntimeError(
+                f"get_signed_upload_url não retornou signed_url. "
+                f"Resposta: {str(result)[:300]}"
+            )
+        return signed_url
+
     def get_signed_url(self, file_path: str, bucket: str = "pdfs", expires_in: int = 120) -> str:
         body = {"action": "get_signed_url", "data": {"file_path": file_path, "bucket": bucket, "expires_in": expires_in}}
         logger.info(f"[SignedURL] Enviando: {body}")

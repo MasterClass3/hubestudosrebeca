@@ -360,16 +360,16 @@ def _upload_image(
     ext: str,
 ) -> None:
     """
-    Faz upload de uma imagem para o Supabase Storage via signed URL.
+    Faz upload de uma imagem para o Supabase Storage.
 
     Fluxo:
-      1. Solicita signed URL de upload à Edge Function (action='get_signed_url')
-      2. PUT dos bytes para a URL retornada
+      1. POST process-callback action='get_signed_upload_url' → signed_url
+      2. PUT image_bytes para signed_url com Content-Type correto
 
     Lança RuntimeError em caso de falha.
     """
-    signed_url = cb.get_signed_url(file_path, bucket="pdfs", expires_in=3600)
-    content_type = _MIME.get(ext, "application/octet-stream")
+    signed_url  = cb.get_signed_upload_url(file_path, bucket="pdfs")
+    content_type = _MIME.get(ext.lower(), "application/octet-stream")
 
     response = httpx.put(
         signed_url,
