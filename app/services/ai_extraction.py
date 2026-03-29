@@ -378,15 +378,19 @@ def extract_and_save_questions(
         if not imgs and has_image_reference(q.get("statement", "")):
             difficulty = "image_missing"
 
-        questions_payload.append({
-            "subject_id":  subject_cache.get(topic),
-            "statement":   q.get("statement", ""),
-            "alternatives": q.get("alternatives", []),
+        entry: dict = {
+            "subject_id":    subject_cache.get(topic),
+            "statement":     q.get("statement", ""),
+            "alternatives":  q.get("alternatives", []),
             "correct_answer": q.get("correct_answer", ""),
-            "topic":       topic,
-            "difficulty":  difficulty,
-            "image_urls":  imgs,
-        })
+            "topic":         topic,
+            "difficulty":    difficulty,
+        }
+        # Só inclui image_urls quando há imagens — evita erro SQL se a coluna
+        # ainda não existir na tabela questions
+        if imgs:
+            entry["image_urls"] = imgs
+        questions_payload.append(entry)
     question_ids = cb.insert_questions(questions_payload, study_plan_id, source_pdf_id)
 
     if not question_ids:
@@ -526,15 +530,19 @@ def save_parsed_questions(
         if not imgs and has_image_reference(q.statement):
             difficulty = "image_missing"
 
-        questions_payload.append({
+        entry: dict = {
             "subject_id":    subject_cache.get(q.topic) or None,
             "statement":     q.statement,
             "alternatives":  q.alternatives,
             "correct_answer": q.correct_answer,
             "topic":         q.topic,
             "difficulty":    difficulty,
-            "image_urls":    imgs,
-        })
+        }
+        # Só inclui image_urls quando há imagens — evita erro SQL se a coluna
+        # ainda não existir na tabela questions
+        if imgs:
+            entry["image_urls"] = imgs
+        questions_payload.append(entry)
 
     logger.info(
         f"[SaveParsed:{pdf_upload_id}] payload amostra — "
