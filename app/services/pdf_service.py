@@ -14,11 +14,14 @@ class PDFScannedError(PDFExtractionError):
     pass
 
 
-def download_and_extract_text(file_path: str) -> str:
+def download_and_extract_text(file_path: str) -> tuple[str, bytes]:
     """
     1. Obtém uma signed URL via Edge Function (process-callback)
     2. Baixa o PDF com httpx usando a signed URL
     3. Extrai o texto com pdfplumber
+
+    Returns:
+        (full_text, pdf_bytes) — pdf_bytes é necessário para extração de imagens
     """
     from app.services.callback_service import get_client
 
@@ -74,4 +77,4 @@ def download_and_extract_text(file_path: str) -> str:
         )
 
     logger.info(f"[PDF] Texto extraído com sucesso ({len(full_text)} caracteres)")
-    return full_text
+    return full_text, pdf_bytes

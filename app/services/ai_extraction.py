@@ -233,6 +233,8 @@ def extract_and_save_questions(
     source_pdf_id: str,
     pdf_upload_id: str = "",
     heartbeat_fn: Callable[[int, str], None] | None = None,
+    pdf_bytes: bytes = b"",
+    user_id: str = "",
 ) -> list[str]:
     """
     Extrai questões em paralelo e faz batch insert.
@@ -331,20 +333,60 @@ def extract_and_save_questions(
         subject_cache[topic] = cb.upsert_subject(topic, study_plan_id)
 
     if heartbeat_fn:
+        heartbeat_fn(84, "Extraindo imagens do PDF")
+
+    # ── Extração de imagens (não-bloqueante) ──────────────────────────────
+    # Para o caminho IA, as questões são numeradas sequencialmente (1, 2, 3…)
+    # O image_service detecta posições via fitz, que pode não coincidir 100%
+    # com a numeração da IA. Usamos o mapa por número como melhor heurística.
+    q_image_map: dict[int, list[dict]] = {}
+    if pdf_bytes and user_id:
+        try:
+            from app.services.image_service import extract_question_images
+            if heartbeat_fn:
+                heartbeat_fn(85, "Extraindo e enviando imagens")
+            q_image_map = extract_question_images(
+                pdf_bytes=pdf_bytes,
+                study_plan_id=study_plan_id,
+                pdf_upload_id=pdf_upload_id,
+                user_id=user_id,
+                cb=cb,
+            )
+            logger.info(
+                f"[Extraction:{pdf_upload_id}] imagens em {len(q_image_map)} questões"
+            )
+        except Exception as img_err:
+            logger.warning(
+                f"[Extraction:{pdf_upload_id}] extração de imagens falhou "
+                f"(não bloqueante): {img_err}"
+            )
+
+    if heartbeat_fn:
         heartbeat_fn(86, f"Salvando {len(all_questions)} questões no banco")
 
     # ── Batch insert de questões ──────────────────────────────────────────
-    questions_payload = [
-        {
-            "subject_id": subject_cache.get(q.get("topic", "Geral")),
-            "statement": q.get("statement", ""),
+    from app.services.image_service import has_image_reference
+
+    questions_payload = []
+    for i, q in enumerate(all_questions):
+        q_num   = i + 1   # numeração sequencial para lookup no image_map
+        imgs    = q_image_map.get(q_num, [])
+        topic   = q.get("topic", "Geral")
+        difficulty = q.get("difficulty", "medium")
+
+        # Questão menciona imagem mas nenhuma foi encontrada → alerta visual
+        if not imgs and has_image_reference(q.get("statement", "")):
+            difficulty = "image_missing"
+
+        questions_payload.append({
+            "subject_id":  subject_cache.get(topic),
+            "statement":   q.get("statement", ""),
             "alternatives": q.get("alternatives", []),
             "correct_answer": q.get("correct_answer", ""),
-            "topic": q.get("topic", "Geral"),
-            "difficulty": q.get("difficulty", "medium"),
-        }
-        for q in all_questions
-    ]
+            "topic":       topic,
+            "difficulty":  difficulty,
+            "image_urls":  imgs,
+        })
     question_ids = cb.insert_questions(questions_payload, study_plan_id, source_pdf_id)
 
     if not question_ids:
@@ -403,6 +445,8 @@ def save_parsed_questions(
     source_pdf_id: str,
     pdf_upload_id: str = "",
     heartbeat_fn: Callable[[int, str], None] | None = None,
+    pdf_bytes: bytes = b"",
+    user_id: str = "",
 ) -> list[str]:
     """
     Salva questões que já foram extraídas via regex pelo smart parser (sem IA).
@@ -440,25 +484,63 @@ def save_parsed_questions(
         subject_cache[topic] = cb.upsert_subject(topic, study_plan_id)
 
     if heartbeat_fn:
-        heartbeat_fn(50, f"Inserindo {total} questões no banco")
+        heartbeat_fn(50, "Extraindo imagens do PDF")
+
+    # ── Extração de imagens (não-bloqueante) ──────────────────────────────
+    # Para o smart parser, questões têm número explícito (q.number) —
+    # o image_service usa esse mesmo número como chave do mapa.
+    q_image_map: dict[int, list[dict]] = {}
+    if pdf_bytes and user_id:
+        try:
+            from app.services.image_service import extract_question_images
+            if heartbeat_fn:
+                heartbeat_fn(52, "Extraindo e enviando imagens")
+            q_image_map = extract_question_images(
+                pdf_bytes=pdf_bytes,
+                study_plan_id=study_plan_id,
+                pdf_upload_id=pdf_upload_id,
+                user_id=user_id,
+                cb=cb,
+            )
+            logger.info(
+                f"[SaveParsed:{pdf_upload_id}] imagens em {len(q_image_map)} questões"
+            )
+        except Exception as img_err:
+            logger.warning(
+                f"[SaveParsed:{pdf_upload_id}] extração de imagens falhou "
+                f"(não bloqueante): {img_err}"
+            )
+
+    if heartbeat_fn:
+        heartbeat_fn(55, f"Inserindo {total} questões no banco")
 
     # ── Batch insert de questões ──────────────────────────────────────────
-    questions_payload = [
-        {
-            "subject_id": subject_cache.get(q.topic) or None,   # None (não "") para FK válida
-            "statement": q.statement,
-            "alternatives": q.alternatives,
+    from app.services.image_service import has_image_reference
+
+    questions_payload = []
+    for q in parsed_questions:
+        imgs       = q_image_map.get(q.number, [])
+        difficulty = q.difficulty
+
+        # Questão menciona imagem mas nenhuma foi encontrada → alerta visual
+        if not imgs and has_image_reference(q.statement):
+            difficulty = "image_missing"
+
+        questions_payload.append({
+            "subject_id":    subject_cache.get(q.topic) or None,
+            "statement":     q.statement,
+            "alternatives":  q.alternatives,
             "correct_answer": q.correct_answer,
-            "topic": q.topic,
-            "difficulty": q.difficulty,
-        }
-        for q in parsed_questions
-    ]
+            "topic":         q.topic,
+            "difficulty":    difficulty,
+            "image_urls":    imgs,
+        })
+
     logger.info(
         f"[SaveParsed:{pdf_upload_id}] payload amostra — "
         f"subject_id={questions_payload[0].get('subject_id')!r} "
         f"topic={questions_payload[0].get('topic')!r} "
-        f"source_pdf_id será={source_pdf_id!r}"
+        f"image_urls={questions_payload[0].get('image_urls')!r}"
     )
     question_ids = cb.insert_questions(questions_payload, study_plan_id, source_pdf_id)
 

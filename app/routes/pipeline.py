@@ -103,12 +103,14 @@ def _run_pipeline(pdf_upload_id: str):
         heartbeat(25, current_stage)
 
         cached_text = upload.get("text_content", "")
+        pdf_bytes: bytes = b""   # disponível apenas no download (não no cache)
+
         if cached_text and len(cached_text) > 100:
             text = cached_text
             _log(pdf_upload_id, "STEP_SUCCESS", f"texto em cache: {len(text)} chars — download ignorado")
         else:
             try:
-                text = download_and_extract_text(file_path)
+                text, pdf_bytes = download_and_extract_text(file_path)
             except PDFScannedError as e:
                 raise PDFScannedError(e) from e
             except PDFExtractionError as e:
@@ -116,13 +118,17 @@ def _run_pipeline(pdf_upload_id: str):
             except Exception as e:
                 raise RuntimeError(f"Falha ao ler PDF: {repr(e)}") from e
 
-            _log(pdf_upload_id, "STEP_SUCCESS", f"texto extraído: {len(text)} chars")
+            _log(pdf_upload_id, "STEP_SUCCESS", f"texto extraído: {len(text)} chars | {len(pdf_bytes)} bytes")
 
             # Persiste para reprocessamentos futuros (best-effort)
             try:
                 cb.save_text_content(pdf_upload_id, text)
             except Exception as cache_err:
                 logger.warning(f"[{pdf_upload_id}] save_text_content falhou (não bloqueante): {cache_err}")
+
+        # Extrai user_id do file_path (formato esperado: "{user_id}/nome.pdf")
+        user_id = file_path.split("/")[0] if "/" in file_path else ""
+
         check_cancel()
         check_timeout()
 
@@ -171,6 +177,8 @@ def _run_pipeline(pdf_upload_id: str):
                             source_pdf_id=pdf_upload_id,
                             pdf_upload_id=pdf_upload_id,
                             heartbeat_fn=heartbeat,
+                            pdf_bytes=pdf_bytes,
+                            user_id=user_id,
                         )
                     else:
                         heartbeat(38, f"{len(parsed_qs)} questões identificadas")
@@ -180,11 +188,12 @@ def _run_pipeline(pdf_upload_id: str):
                             source_pdf_id=pdf_upload_id,
                             pdf_upload_id=pdf_upload_id,
                             heartbeat_fn=heartbeat,
+                            pdf_bytes=pdf_bytes,
+                            user_id=user_id,
                         )
                 else:
                     # ── Caminho padrão: extração via IA ──────────────────
                     # Tenta extrair metadados mesmo sem estrutura detectada
-                    # (cabeçalhos "Ano:", "Banca:", "Órgão:", "Prova:" podem estar presentes)
                     try:
                         ai_meta = _extract_meta(text)
                         if ai_meta.concurso_name and ai_meta.concurso_name != "Concurso Importado":
@@ -199,6 +208,8 @@ def _run_pipeline(pdf_upload_id: str):
                         source_pdf_id=pdf_upload_id,
                         pdf_upload_id=pdf_upload_id,
                         heartbeat_fn=heartbeat,
+                        pdf_bytes=pdf_bytes,
+                        user_id=user_id,
                     )
 
             except Exception as e:
