@@ -157,9 +157,41 @@ class SupabaseCallbackClient:
         for q in questions:
             q.setdefault("study_plan_id", study_plan_id)
             q.setdefault("source_pdf_id", source_pdf_id)
+
         result = self.call("insert_questions", {"questions": questions})
+
+        # Tenta extrair IDs da resposta direta
+        ids: list[str] = []
         if isinstance(result, dict):
-            return result.get("ids", [])
+            # Formato {"ids": [...]}
+            ids = result.get("ids") or []
+            # Formato {"data": [{"id": ...}, ...]}
+            if not ids:
+                data = result.get("data") or []
+                if isinstance(data, list):
+                    ids = [row["id"] for row in data if isinstance(row, dict) and row.get("id")]
+
+        if ids:
+            return ids
+
+        # Read-after-write: Edge Function pode não retornar IDs no insert
+        # (Supabase .insert() sem .select() retorna null — buscamos direto)
+        logger.info(
+            f"[insert_questions] insert não retornou IDs — "
+            f"buscando por source_pdf_id={source_pdf_id}"
+        )
+        rows = self.read("questions", {"source_pdf_id": source_pdf_id})
+        if rows and isinstance(rows, list):
+            ids = [row["id"] for row in rows if isinstance(row, dict) and row.get("id")]
+
+        if ids:
+            logger.info(f"[insert_questions] read-after-write encontrou {len(ids)} IDs")
+            return ids
+
+        logger.error(
+            f"[insert_questions] não foi possível obter IDs após insert "
+            f"(source_pdf_id={source_pdf_id})"
+        )
         return []
 
     def insert_justifications(self, justifications: list):
